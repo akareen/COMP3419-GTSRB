@@ -1,80 +1,199 @@
-import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+
+# Part 1
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+class SEDenseNet(nn.Module):
+    def __init__(self, num_classes=43):
+        super(SEDenseNet, self).__init__()
+        self.features = models.densenet121(pretrained=True).features
+        self.se_block = SEBlock(1024)
+        self.classifier = nn.Linear(1024, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = F.relu(x, inplace=True)
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = torch.flatten(x, 1)
+        x = self.se_block(x)
+        x = self.classifier(x)
+        return x
+
+
+# Part 2
+
+import torchvision.transforms as transforms
+import kornia as K
+
+base_transforms = transforms.Compose([
+    transforms.Resize([112, 112]),
+    transforms.ToTensor(),      
+    transforms.Lambda(lambda img: K.color.rgb_to_luv(img)) 
+])
+
+
+augment_transforms = transforms.Compose([
+    transforms.Resize([112, 112]),
+    transforms.RandomHorizontalFlip(),  
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.ToTensor(),
+    transforms.Lambda(lambda img: K.color.rgb_to_luv(img))  
+])
+
+
+# Part 3
+
+import torch.utils.data as data
+import torchvision.datasets as datasets
+
+train_data_path = "./data/TRAIN/"
+
+train_data_base = datasets.ImageFolder(root=train_data_path, transform=base_transforms)
+train_data_augmented = datasets.ImageFolder(root=train_data_path, transform=augment_transforms)
+
+train_data_combined = data.ConcatDataset([train_data_base, train_data_augmented])
+
+train_size = int(0.8 * len(train_data_combined))
+val_size = len(train_data_combined) - train_size
+train_dataset, val_dataset = data.random_split(train_data_combined, [train_size, val_size])
+
+BATCH_SIZE = 256 
+train_loader = data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = data.DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+
+# Part 4
+
+import torch.optim as optim
+import torch.nn as nn
+from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
-from PIL import Image, ImageOps
+
+
+import pandas as pd
 import os
-from keras.applications.densenet import preprocess_input
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
 
-def load_data(training_data_dir, testing_data_dir, testing_annotation_file_name, target_size=(224, 224)):
-    train_images, train_labels = load_training_data(training_data_dir, target_size)
-    test_images, test_metadata = load_testing_data(testing_data_dir, testing_annotation_file_name, target_size)
-    return train_images, train_labels, test_images, test_metadata
+def aggregate_class_labels(data_path):
+    class_labels = []
 
-def load_training_data(training_data_dir, target_size=(224, 224)):
-    images = []
-    labels = []
+    for folder_name in os.listdir(data_path):
+        folder_path = os.path.join(data_path, folder_name)
+        if os.path.isdir(folder_path):
+            csv_file = os.path.join(folder_path, f'GT-{folder_name}.csv')
+            if os.path.isfile(csv_file):
+                df = pd.read_csv(csv_file, sep=';', usecols=['ClassId'])
+                class_labels.extend(df['ClassId'].tolist())
 
-    for class_folder_name in os.listdir(training_data_dir):
-        class_folder_path = os.path.join(training_data_dir, class_folder_name)
-        print(f"Processing class: {class_folder_name}")  # Debugging print statement
-        if os.path.isdir(class_folder_path):
-            annotation_file_name = f'GT-{class_folder_name}.csv'
-            annotation_file_path = os.path.join(class_folder_path, annotation_file_name)
-            if not os.path.isfile(annotation_file_path):
-                continue  # Handle missing annotation file
-            annotations = pd.read_csv(annotation_file_path, delimiter=';')
-            for _, row in annotations.iterrows():
-                image_path = os.path.join(class_folder_path, row['Filename'])
-                if not os.path.isfile(image_path):
-                    continue
-                image = Image.open(image_path)
-                image = ImageOps.fit(image, target_size, Image.Resampling.LANCZOS)  # Resize the image
-                image = np.array(image)
-                image = preprocess_input(image)  # Normalize for DenseNet
-                images.append(image)
-                labels.append(row['ClassId'])
+    return np.array(class_labels)
 
-    return np.array(images), np.array(labels)
+train_data_path = "./data/TRAIN/"
 
-def load_testing_data(testing_data_dir, annotation_file_name, target_size=(224, 224)):
-    images = []
-    metadata = []
+classes_training = aggregate_class_labels(train_data_path)
 
-    annotation_file_path = os.path.join(testing_data_dir, annotation_file_name)
-    if not os.path.isfile(annotation_file_path):
-        return np.array(images), metadata  # Handle missing annotation file
+class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(classes_training), y=classes_training)
+class_weights = torch.tensor(class_weights, dtype=torch.float).cuda()
 
-    annotations = pd.read_csv(annotation_file_path, delimiter=';')
+
+model = SEDenseNet(num_classes=43).cuda()
+
+learning_rate = 0.001
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+
+# Part 5
+
+import time
+
+def calculate_accuracy(y_pred, y):
+    top_pred = y_pred.argmax(1, keepdim=True)
+    correct = top_pred.eq(y.view_as(top_pred)).sum()
+    acc = correct.float() / y.shape[0]
+    return acc
+
+def train(model, loader, optimizer, criterion, device):
+    epoch_loss = 0
+    epoch_acc = 0
     
-    for _, row in annotations.iterrows():
-        image_path = os.path.join(testing_data_dir, row['Filename'])
-        if not os.path.isfile(image_path):
-            continue
-        image = Image.open(image_path)
-        image = image.resize(target_size, Image.Resampling.LANCZOS)
-        image = np.array(image)
-        image = preprocess_input(image)  # Normalize for DenseNet
-        images.append(image)
-        metadata.append(row.to_dict())
+    model.train()
+    
+    for (images, labels) in loader:
+        images = images.to(device)
+        labels = labels.to(device)
 
-    return np.array(images), metadata
+        optimizer.zero_grad()
+        predictions = model(images)
+        loss = criterion(predictions, labels)
+        acc = calculate_accuracy(predictions, labels)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        epoch_acc += acc.item()
+    
+    return epoch_loss / len(loader), epoch_acc / len(loader)
+
+def evaluate(model, loader, criterion, device):
+    epoch_loss = 0
+    epoch_acc = 0
+    
+    model.eval()
+    
+    with torch.no_grad():
+        for (images, labels) in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            predictions = model(images)
+            loss = criterion(predictions, labels)
+            acc = calculate_accuracy(predictions, labels)
+
+            epoch_loss += loss.item()
+            epoch_acc += acc.item()
+    
+    return epoch_loss / len(loader), epoch_acc / len(loader)
+
+EPOCHS = 10
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+for epoch in range(EPOCHS):
+    start_time = time.time()
+
+    train_loss, train_acc = train(model, train_loader, optimizer, criterion, device)
+    val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+
+    end_time = time.time()
+
+    print(f'Epoch: {epoch+1:02}, Train Loss: {train_loss:.3f}, Train Acc: {train_acc*100:.2f}%, Val. Loss: {val_loss:.3f}, Val. Acc: {val_acc*100:.2f}%, Time: {end_time - start_time:.2f}s')
 
 
-def checks():
-    train_images, train_labels, test_images, test_metadata = load_data(
-        'data/GTSRB_Training_Images/Final_Training/Images', 
-        'data/GTSRB_Testing_Images/Final_Test/Images', 
-        'GT-final_test.test.csv'
-    )
+# Part 6
+import matplotlib.pyplot as plt
+import os
 
-
-    # Verify the number of training samples
-    print("Training data shape:", train_images.shape)
-    print("Training labels shape:", train_labels.shape)
-    print("Testing data shape:", test_images.shape)
-    print("Testing metadata shape:", len(test_metadata))
-
-    # Verify the number of classes
-    unique_classes = np.unique(train_labels)
-    print("Number of unique classes:", len(unique_classes))
-
-checks()
+model_save_path = './models/SEDenseNet_model.pth'
+os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+torch.save(model.state_dict(), model_save_path)
+print(f'Model saved to {model_save_path}')
